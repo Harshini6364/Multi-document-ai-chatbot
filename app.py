@@ -1,14 +1,26 @@
 import time
 import tempfile
+import re
 
 import streamlit as st
 
 from dotenv import load_dotenv
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 from langchain_groq import ChatGroq
+
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    UnstructuredPowerPointLoader
+)
+
+from langchain_core.documents import Document
+
+from pptx import Presentation
+
+from langchain_text_splitters import (
+    RecursiveCharacterTextSplitter
+)
 
 from rank_bm25 import BM25Okapi
 
@@ -20,7 +32,7 @@ from rank_bm25 import BM25Okapi
 load_dotenv()
 
 # -------------------------
-# GROQ LLM
+# LLM
 # -------------------------
 
 llm = ChatGroq(
@@ -29,17 +41,19 @@ llm = ChatGroq(
 )
 
 # -------------------------
-# STREAMLIT PAGE
+# STREAMLIT
 # -------------------------
 
 st.set_page_config(
-    page_title="Advanced AI Assistant",
+    page_title="Multi-Document AI Assistant",
     layout="wide"
 )
 
-st.title("📄 Advanced Vector-less AI Assistant")
+st.title("📄 Multi-Document AI Assistant")
 
-st.write("Multi-Document AI Assistant using BM25 + Groq")
+st.write(
+    "Advanced Vector-less AI Assistant using BM25 + Groq"
+)
 
 # -------------------------
 # SESSION STATE
@@ -55,7 +69,37 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 # -------------------------
-# FILE UPLOAD
+# TEXT PREPROCESSING
+# -------------------------
+
+def preprocess(text):
+
+    text = text.lower()
+
+    text = re.sub(
+        r"[^a-zA-Z0-9 ]",
+        " ",
+        text
+    )
+
+    return text.split()
+
+# -------------------------
+# QUERY EXPANSION
+# -------------------------
+
+abbreviations = {
+    "srs": "software requirement specification",
+    "cn": "computer networks",
+    "dbms": "database management system",
+    "os": "operating system",
+    "ai": "artificial intelligence",
+    "ml": "machine learning",
+    "nlp": "natural language processing"
+}
+
+# -------------------------
+# SIDEBAR
 # -------------------------
 
 with st.sidebar:
@@ -63,8 +107,20 @@ with st.sidebar:
     st.header("📂 Upload Documents")
 
     uploaded_files = st.file_uploader(
-        "Upload PDFs",
-        type="pdf",
+        "Upload Files",
+        type=[
+            "pdf",
+            "txt",
+            "pptx",
+            "sql",
+            "java",
+            "py",
+            "c",
+            "cpp",
+            "js",
+            "html",
+            "css"
+        ],
         accept_multiple_files=True
     )
 
@@ -86,7 +142,7 @@ with st.sidebar:
         st.info("No files uploaded yet")
 
 # -------------------------
-# PROCESS DOCUMENTS
+# PROCESS FILES
 # -------------------------
 
 if uploaded_files:
@@ -98,40 +154,122 @@ if uploaded_files:
 
     for uploaded_file in uploaded_files:
 
-        # avoid duplicate upload
         if uploaded_file.name in existing_sources:
             continue
 
+        ext = uploaded_file.name.split(".")[-1].lower()
+
         with tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=".pdf"
-        ) as tmp_file:
+            suffix=f".{ext}"
+        ) as tmp:
 
-            tmp_file.write(uploaded_file.read())
+            tmp.write(uploaded_file.read())
 
-            temp_path = tmp_file.name
+            temp_path = tmp.name
 
-        loader = PyPDFLoader(temp_path)
+        try:
 
-        docs = loader.load()
+            # -------------------------
+            # PDF
+            # -------------------------
+
+            if ext == "pdf":
+
+                loader = PyPDFLoader(temp_path)
+
+                docs = loader.load()
+
+            # -------------------------
+            # PPTX
+            # -------------------------
+
+            elif ext == "pptx":
+
+                prs = Presentation(temp_path)
+
+                docs = []
+
+                for slide_num, slide in enumerate(prs.slides):
+
+                    slide_text = []
+
+                    for shape in slide.shapes:
+
+                        if hasattr(shape, "text"):
+
+                            text = shape.text.strip()
+
+                            if text:
+
+                                slide_text.append(text)
+
+                    combined_text = "\n".join(slide_text)
+
+                    if combined_text.strip():
+
+                        docs.append(
+                            Document(
+                                page_content=combined_text,
+                                metadata={
+                                    "page": slide_num + 1
+                                }
+                            )
+                        )
+
+            # -------------------------
+            # TEXT FILES
+            # -------------------------
+
+            else:
+
+                loader = TextLoader(
+                    temp_path,
+                    encoding="utf-8"
+                )
+
+                docs = loader.load()
+
+        except Exception as e:
+
+            st.error(
+                f"Error loading "
+                f"{uploaded_file.name}"
+            )
+
+            continue
+
+        # -------------------------
+        # TEXT SPLITTER
+        # -------------------------
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
+            chunk_size=2000,
+            chunk_overlap=400
         )
 
         chunks = splitter.split_documents(docs)
 
         for chunk in chunks:
 
-            chunk.metadata["source"] = uploaded_file.name
+            chunk.metadata["source"] = (
+                uploaded_file.name
+            )
 
-            st.session_state.all_chunks.append(chunk)
+            chunk.metadata["page"] = (
+                chunk.metadata.get("page", 1)
+            )
 
-    st.success("Documents processed successfully!")
+            st.session_state.all_chunks.append(
+                chunk
+            )
+
+    st.success(
+        "Documents processed successfully!"
+    )
 
 # -------------------------
-# BM25 INDEX
+# BM25
 # -------------------------
 
 bm25 = None
@@ -144,14 +282,14 @@ if st.session_state.all_chunks:
     ]
 
     tokenized_chunks = [
-        text.lower().split()
+        preprocess(text)
         for text in chunk_texts
     ]
 
     bm25 = BM25Okapi(tokenized_chunks)
 
 # -------------------------
-# DISPLAY OLD CHAT
+# OLD CHAT
 # -------------------------
 
 for chat in st.session_state.chat_history:
@@ -160,42 +298,31 @@ for chat in st.session_state.chat_history:
 
         st.write(chat["message"])
 
-        # assistant metadata
         if chat["role"] == "assistant":
 
             st.markdown("---")
 
             st.markdown(
-                f"⏱️ **Response Time:** `{chat['response_time']} sec`"
+                f"⏱️ Response Time: "
+                f"`{chat['response_time']} sec`"
             )
 
-            if (
-                "information is not available"
-                not in chat["message"].lower()
-                and "answer not found"
-                not in chat["message"].lower()
-                and chat["citations"]
-            ):
-
-                sources_text = " | ".join(
-                    chat["citations"]
-                )
+            if chat["citations"]:
 
                 st.markdown(
-                    f"📚 **Sources:** {sources_text}"
+                    "📚 Sources: "
+                    + " | ".join(chat["citations"])
                 )
 
 # -------------------------
-# USER QUESTION
+# USER QUERY
 # -------------------------
 
-query = st.chat_input("Ask a question...")
+query = st.chat_input(
+    "Ask a question..."
+)
 
 if query and st.session_state.all_chunks:
-
-    # -------------------------
-    # SAVE USER MESSAGE
-    # -------------------------
 
     st.session_state.chat_history.append(
         {
@@ -208,29 +335,32 @@ if query and st.session_state.all_chunks:
 
     normalized_query = query.lower().strip()
 
+    expanded_query = normalized_query
+
+    for short, full in abbreviations.items():
+
+        if short in normalized_query:
+
+            expanded_query += " " + full
+
     # -------------------------
-    # CACHE CHECK
+    # CACHE
     # -------------------------
 
-    if normalized_query in st.session_state.cache:
+    if expanded_query in st.session_state.cache:
 
-        # -------------------------
-        # CACHE TIMER
-        # -------------------------
+        start = time.time()
 
-        cache_start = time.time()
-
-        cached_data = st.session_state.cache[
-            normalized_query
+        cached = st.session_state.cache[
+            expanded_query
         ]
 
-        answer = cached_data["answer"]
+        answer = cached["answer"]
 
-        citations = cached_data["citations"]
+        citations = cached["citations"]
 
-        # ultra fast cache response
         response_time = round(
-            time.time() - cache_start,
+            time.time() - start,
             4
         )
 
@@ -241,33 +371,20 @@ if query and st.session_state.all_chunks:
             st.markdown("---")
 
             st.markdown(
-                f"⏱️ **Response Time:** `{response_time} sec`"
+                f"⏱️ Response Time: "
+                f"`{response_time} sec`"
             )
 
-            # -------------------------
-            # SHOW SOURCES ONLY
-            # IF ANSWER EXISTS
-            # -------------------------
-
-            if (
-                "information is not available"
-                not in answer.lower()
-                and "answer not found"
-                not in answer.lower()
-                and citations
-            ):
-
-                sources_text = " | ".join(citations)
+            if citations:
 
                 st.markdown(
-                    f"📚 **Sources:** {sources_text}"
+                    "📚 Sources: "
+                    + " | ".join(citations)
                 )
 
-            st.success("⚡ Response fetched from cache")
-
-        # -------------------------
-        # SAVE CHAT
-        # -------------------------
+            st.success(
+                "⚡ Response fetched from cache"
+            )
 
         st.session_state.chat_history.append(
             {
@@ -284,42 +401,30 @@ if query and st.session_state.all_chunks:
         start_time = time.time()
 
         # -------------------------
-        # BM25 RETRIEVAL
+        # BM25 SEARCH
         # -------------------------
 
-        tokenized_query = normalized_query.split()
-
         scores = bm25.get_scores(
-            tokenized_query
-        )
-
-        scored_chunks = list(
-            zip(
-                st.session_state.all_chunks,
-                scores
-            )
+            preprocess(expanded_query)
         )
 
         scored_chunks = sorted(
-            scored_chunks,
+            zip(
+                st.session_state.all_chunks,
+                scores
+            ),
             key=lambda x: x[1],
             reverse=True
         )
 
-        # -------------------------
-        # FILTER RELEVANT CHUNKS
-        # -------------------------
-
-        filtered_chunks = [
+        top_chunks = [
             (chunk, score)
             for chunk, score in scored_chunks
             if score > 0
-        ]
-
-        top_chunks = filtered_chunks[:5]
+        ][:8]
 
         # -------------------------
-        # IF NOTHING RELEVANT
+        # NO MATCH
         # -------------------------
 
         if not top_chunks:
@@ -329,165 +434,117 @@ if query and st.session_state.all_chunks:
                 "in the uploaded documents."
             )
 
-            response_time = round(
-                time.time() - start_time,
-                2
-            )
-
             citations = []
-
-            with st.chat_message("assistant"):
-
-                st.write(answer)
-
-                st.markdown("---")
-
-                st.markdown(
-                    f"⏱️ **Response Time:** `{response_time} sec`"
-                )
-
-            # -------------------------
-            # SAVE CHAT
-            # -------------------------
-
-            st.session_state.chat_history.append(
-                {
-                    "role": "assistant",
-                    "message": answer,
-                    "response_time": response_time,
-                    "citations": [],
-                    "cached": False
-                }
-            )
 
         else:
 
-            # -------------------------
-            # CONTEXT
-            # -------------------------
-
-            context = "\n\n".join(
-                [
-                    chunk.page_content
-                    for chunk, score in top_chunks
-                ]
-            )
-
-            # -------------------------
-            # PROMPT
-            # -------------------------
+            context = "\n\n".join([
+                chunk.page_content
+                for chunk, score in top_chunks
+            ])
 
             prompt = f"""
-            You are a strict document question-answering assistant.
+You are a document question-answering assistant.
 
-            Answer ONLY using the provided context.
+Rules:
+1. Answer ONLY from the context.
+2. Give partial answers if available.
+3. Do NOT use outside knowledge.
+4. Say 'The information is not available in the uploaded documents.'
+only if no relevant content exists.
 
-            Do NOT use your own knowledge.
+Context:
+{context}
 
-            If the answer is not explicitly present
-            in the context, reply exactly with:
-
-            'The information is not available in the uploaded documents.'
-
-            Context:
-            {context}
-
-            Question:
-            {query}
-            """
-
-            # -------------------------
-            # LLM RESPONSE
-            # -------------------------
+Question:
+{query}
+"""
 
             response = llm.invoke(prompt)
 
-            answer = response.content
-
-            end_time = time.time()
-
-            response_time = round(
-                end_time - start_time,
-                2
-            )
-
-            # -------------------------
-            # SOURCES
-            # -------------------------
-
-            shown = set()
+            answer = response.content.strip()
 
             citations = []
 
-            for chunk, score in top_chunks:
+            shown = set()
 
-                source = chunk.metadata.get(
-                    "source"
-                )
+            if (
+                "information is not available"
+                not in answer.lower()
+            ):
 
-                page = chunk.metadata.get(
-                    "page"
-                )
+                for chunk, score in top_chunks:
 
-                citation = (
-                    f"{source} - Page {page}"
-                )
-
-                if citation not in shown:
-
-                    shown.add(citation)
-
-                    citations.append(citation)
-
-            # -------------------------
-            # SHOW RESPONSE
-            # -------------------------
-
-            with st.chat_message("assistant"):
-
-                st.write(answer)
-
-                st.markdown("---")
-
-                st.markdown(
-                    f"⏱️ **Response Time:** `{response_time} sec`"
-                )
-
-                if (
-                    "information is not available"
-                    not in answer.lower()
-                    and "answer not found"
-                    not in answer.lower()
-                    and citations
-                ):
-
-                    sources_text = " | ".join(citations)
-
-                    st.markdown(
-                        f"📚 **Sources:** {sources_text}"
+                    citation = (
+                        f"{chunk.metadata.get('source')} "
+                        f"- Page "
+                        f"{chunk.metadata.get('page', 1)}"
                     )
 
-            # -------------------------
-            # SAVE CHAT
-            # -------------------------
+                    if citation not in shown:
 
-            st.session_state.chat_history.append(
-                {
-                    "role": "assistant",
-                    "message": answer,
-                    "response_time": response_time,
-                    "citations": citations,
-                    "cached": False
-                }
+                        shown.add(citation)
+
+                        citations.append(citation)
+
+        response_time = round(
+            time.time() - start_time,
+            2
+        )
+
+        # -------------------------
+        # SHOW RESPONSE
+        # -------------------------
+
+        with st.chat_message("assistant"):
+
+            st.write(answer)
+
+            st.markdown("---")
+
+            st.markdown(
+                f"⏱️ Response Time: "
+                f"`{response_time} sec`"
             )
 
-            # -------------------------
-            # SAVE CACHE
-            # -------------------------
+            if citations:
 
-            st.session_state.cache[
-                normalized_query
-            ] = {
-                "answer": answer,
-                "citations": citations
+                st.markdown(
+                    "📚 Sources: "
+                    + " | ".join(citations)
+                )
+
+        # -------------------------
+        # SAVE CHAT
+        # -------------------------
+
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "message": answer,
+                "response_time": response_time,
+                "citations": citations,
+                "cached": False
             }
+        )
+
+        # -------------------------
+        # SAVE CACHE
+        # -------------------------
+
+        st.session_state.cache[
+            expanded_query
+        ] = {
+            "answer": answer,
+            "citations": citations
+        }
+
+# -------------------------
+# NO FILE WARNING
+# -------------------------
+
+elif query and not st.session_state.all_chunks:
+
+    st.warning(
+        "Please upload at least one document."
+    )
